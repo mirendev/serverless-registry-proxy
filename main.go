@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -63,6 +64,18 @@ func main() {
 		log.Fatal("REPO_PREFIX environment variable not specified")
 	}
 
+	allowedImages := parseAllowedImages(os.Getenv("ALLOWED_IMAGES"))
+	if len(allowedImages) == 0 {
+		log.Printf("image allowlist disabled (ALLOWED_IMAGES unset or empty): forwarding all images")
+	} else {
+		names := make([]string, 0, len(allowedImages))
+		for name := range allowedImages {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		log.Printf("image allowlist enabled: %s", strings.Join(names, ", "))
+	}
+
 	reg := registryConfig{
 		host:       registryHost,
 		repoPrefix: repoPrefix,
@@ -93,7 +106,7 @@ func main() {
 	if tokenEndpoint != "" {
 		mux.Handle("/_token", tokenProxyHandler(tokenEndpoint, repoPrefix))
 	}
-	mux.Handle("/v2/", registryAPIProxy(reg, auth))
+	mux.Handle("/v2/", allowlistMiddleware(allowedImages, registryAPIProxy(reg, auth)))
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	handler := captureHostHeader(mux)
@@ -171,6 +184,59 @@ func browserRedirectHandler(cfg registryConfig) http.HandlerFunc {
 		url := fmt.Sprintf("https://%s/%s%s", cfg.host, cfg.repoPrefix, r.RequestURI)
 		http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 	}
+}
+
+// parseAllowedImages parses a comma-separated list of image names (as set in
+// the ALLOWED_IMAGES env var) into a set. Surrounding spaces are trimmed and
+// empty entries are ignored. An empty/unset value yields a nil set, which the
+// allowlistMiddleware treats as "allow everything".
+func parseAllowedImages(raw string) map[string]struct{} {
+	set := make(map[string]struct{})
+	for _, name := range strings.Split(raw, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		set[name] = struct{}{}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return set
+}
+
+// imageNameFromPath extracts the image name from a Docker Registry v2 API path
+// like /v2/{image}/manifests/latest, returning the first path segment after
+// /v2/. It returns "" for the bare /v2/ ping endpoint (which has no image).
+func imageNameFromPath(path string) string {
+	rest := strings.TrimPrefix(path, "/v2/")
+	if rest == "" || rest == path {
+		return ""
+	}
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		return rest[:i]
+	}
+	return rest
+}
+
+// allowlistMiddleware guards the /v2/ registry proxy with an image-name
+// allowlist. When the allowlist is empty (nil), all requests pass through
+// unchanged. Otherwise any /v2/{image}/... request whose image name is not in
+// the allowlist is rejected with 404. The bare /v2/ ping endpoint always
+// passes, since it carries no image name.
+func allowlistMiddleware(allowed map[string]struct{}, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(allowed) > 0 {
+			if image := imageNameFromPath(r.URL.Path); image != "" {
+				if _, ok := allowed[image]; !ok {
+					log.Printf("rejecting request for disallowed image %q: %s", image, r.URL.Path)
+					http.NotFound(w, r)
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // registryAPIProxy returns a reverse proxy to the specified registry.
