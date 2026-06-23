@@ -44,6 +44,7 @@ type myContextKey string
 type registryConfig struct {
 	host       string
 	repoPrefix string
+	aliases    map[string]string
 }
 
 func main() {
@@ -76,9 +77,20 @@ func main() {
 		log.Printf("image allowlist enabled: %s", strings.Join(names, ", "))
 	}
 
+	imageAliases := parseImageAliases(os.Getenv("IMAGE_ALIASES"))
+	if len(imageAliases) > 0 {
+		var pairs []string
+		for from, to := range imageAliases {
+			pairs = append(pairs, fmt.Sprintf("%s -> %s", from, to))
+		}
+		sort.Strings(pairs)
+		log.Printf("image alias routing enabled: %s", strings.Join(pairs, ", "))
+	}
+
 	reg := registryConfig{
 		host:       registryHost,
 		repoPrefix: repoPrefix,
+		aliases:    imageAliases,
 	}
 
 	tokenEndpoint, err := discoverTokenService(reg.host)
@@ -104,7 +116,7 @@ func main() {
 		mux.Handle("/", browserRedirectHandler(reg))
 	}
 	if tokenEndpoint != "" {
-		mux.Handle("/_token", tokenProxyHandler(tokenEndpoint, repoPrefix))
+		mux.Handle("/_token", tokenProxyHandler(tokenEndpoint, repoPrefix, imageAliases))
 	}
 	mux.Handle("/v2/", allowlistMiddleware(allowedImages, registryAPIProxy(reg, auth)))
 
@@ -153,7 +165,7 @@ func captureHostHeader(next http.Handler) http.Handler {
 // It adjusts the ?scope= parameter in the query from "repository:foo:..." to
 // "repository:repoPrefix/foo:.." and reverse proxies the query to the specified
 // tokenEndpoint.
-func tokenProxyHandler(tokenEndpoint, repoPrefix string) http.HandlerFunc {
+func tokenProxyHandler(tokenEndpoint, repoPrefix string, aliases map[string]string) http.HandlerFunc {
 	return (&httputil.ReverseProxy{
 		FlushInterval: -1,
 		Director: func(r *http.Request) {
@@ -164,7 +176,8 @@ func tokenProxyHandler(tokenEndpoint, repoPrefix string) http.HandlerFunc {
 			if scope == "" {
 				return
 			}
-			newScope := strings.Replace(scope, "repository:", fmt.Sprintf("repository:%s/", repoPrefix), 1)
+			newScope := rewriteScopeAlias(scope, aliases)
+			newScope = resolveScopePath(repoPrefix, newScope)
 			q.Set("scope", newScope)
 			u, _ := url.Parse(tokenEndpoint)
 			u.RawQuery = q.Encode()
@@ -203,6 +216,157 @@ func parseAllowedImages(raw string) map[string]struct{} {
 		return nil
 	}
 	return set
+}
+
+// parseImageAliases parses a comma-separated list of image alias mappings
+// (as set in the IMAGE_ALIASES env var) like "bun:oven/bun,valkey:valkey/valkey"
+// into a map of from -> to. Surrounding spaces are trimmed and invalid entries
+// are skipped.
+func parseImageAliases(raw string) map[string]string {
+	if raw == "" {
+		return nil
+	}
+	aliases := make(map[string]string)
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.Split(part, ":")
+		if len(kv) != 2 {
+			log.Printf("warning: invalid image alias format %q (expected 'from:to')", part)
+			continue
+		}
+		from := strings.TrimSpace(kv[0])
+		to := strings.TrimSpace(kv[1])
+		if from == "" || to == "" {
+			log.Printf("warning: empty image alias key or value in %q", part)
+			continue
+		}
+		aliases[from] = to
+	}
+	if len(aliases) == 0 {
+		return nil
+	}
+	return aliases
+}
+
+// rewriteAlias translates a path like /v2/bun/manifests/... to /v2/oven/bun/manifests/...
+// based on the configured aliases map.
+func rewriteAlias(path string, aliases map[string]string) string {
+	if len(aliases) == 0 {
+		return path
+	}
+	if !strings.HasPrefix(path, "/v2/") || path == "/v2/" {
+		return path
+	}
+	if strings.HasSuffix(path, "/manifests/v1") || strings.HasSuffix(path, "/manifests/v2") {
+		return path
+	}
+	rest := strings.TrimPrefix(path, "/v2/")
+	for from, to := range aliases {
+		if rest == from {
+			return "/v2/" + to
+		}
+		if strings.HasPrefix(rest, from+"/") {
+			return "/v2/" + to + "/" + strings.TrimPrefix(rest, from+"/")
+		}
+	}
+	return path
+}
+
+// rewriteScopeAlias translates a scope string like "repository:bun:pull" to "repository:oven/bun:pull"
+// based on the configured aliases map.
+func rewriteScopeAlias(scope string, aliases map[string]string) string {
+	if len(aliases) == 0 {
+		return scope
+	}
+	if !strings.HasPrefix(scope, "repository:") {
+		return scope
+	}
+	parts := strings.SplitN(scope, ":", 3)
+	if len(parts) < 2 {
+		return scope
+	}
+	repo := parts[1]
+	for from, to := range aliases {
+		if repo == from {
+			parts[1] = to
+			return strings.Join(parts, ":")
+		}
+		if strings.HasPrefix(repo, from+"/") {
+			parts[1] = to + "/" + strings.TrimPrefix(repo, from+"/")
+			return strings.Join(parts, ":")
+		}
+	}
+	return scope
+}
+
+// resolveRepositoryPath resolves the correct GCP registry repository path, routing
+// paths with a "-remote" prefix directly to that repository instead of the default prefix.
+func resolveRepositoryPath(repoPrefix, path string) string {
+	if !strings.HasPrefix(path, "/v2/") || path == "/v2/" {
+		return path
+	}
+	parts := strings.SplitN(repoPrefix, "/", 2)
+	project := parts[0]
+	defaultRepo := ""
+	if len(parts) > 1 {
+		defaultRepo = parts[1]
+	}
+
+	rest := strings.TrimPrefix(path, "/v2/")
+	if strings.HasPrefix(rest, project+"/") {
+		return path
+	}
+	firstSegment := rest
+	if idx := strings.IndexByte(rest, '/'); idx >= 0 {
+		firstSegment = rest[:idx]
+	}
+
+	if strings.HasSuffix(firstSegment, "-remote") {
+		return "/v2/" + project + "/" + rest
+	}
+	return "/v2/" + project + "/" + defaultRepo + "/" + rest
+}
+
+// resolveScopePath resolves the scope for token requests, routing scopes with a
+// "-remote" prefix directly to that repository instead of the default prefix.
+func resolveScopePath(repoPrefix, scope string) string {
+	if !strings.HasPrefix(scope, "repository:") {
+		return scope
+	}
+	parts := strings.SplitN(repoPrefix, "/", 2)
+	project := parts[0]
+	defaultRepo := ""
+	if len(parts) > 1 {
+		defaultRepo = parts[1]
+	}
+
+	scopeParts := strings.SplitN(scope, ":", 3)
+	if len(scopeParts) < 2 {
+		return scope
+	}
+	repo := scopeParts[1]
+	if strings.HasPrefix(repo, project+"/") {
+		return scope
+	}
+
+	rest := repo
+	firstSegment := rest
+	if idx := strings.IndexByte(rest, '/'); idx >= 0 {
+		firstSegment = rest[:idx]
+	}
+
+	var finalRepo string
+	if strings.HasSuffix(firstSegment, "-remote") {
+		finalRepo = project + "/" + rest
+	} else {
+		finalRepo = project + "/" + defaultRepo + "/" + rest
+	}
+
+	scopeParts[1] = finalRepo
+	return strings.Join(scopeParts, ":")
 }
 
 // imageNameFromPath extracts the image name from a Docker Registry v2 API path
@@ -259,7 +423,8 @@ func rewriteRegistryV2URL(c registryConfig) func(*http.Request) {
 		req.URL.Scheme = "https"
 		req.URL.Host = c.host
 		if req.URL.Path != "/v2/" {
-			req.URL.Path = re.ReplaceAllString(req.URL.Path, fmt.Sprintf("/v2/%s/", c.repoPrefix))
+			req.URL.Path = rewriteAlias(req.URL.Path, c.aliases)
+			req.URL.Path = resolveRepositoryPath(c.repoPrefix, req.URL.Path)
 		}
 		log.Printf("rewrote url: %s into %s", u, req.URL)
 	}
