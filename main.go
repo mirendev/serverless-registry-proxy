@@ -368,30 +368,50 @@ func resolveScopePath(repoPrefix, scope string) string {
 	return strings.Join(scopeParts, ":")
 }
 
-// imageNameFromPath extracts the image name from a Docker Registry v2 API path
-// like /v2/{image}/manifests/latest, returning the first path segment after
-// /v2/. It returns "" for the bare /v2/ ping endpoint (which has no image).
-func imageNameFromPath(path string) string {
+// repoNameFromPath extracts the repository name from a Docker Registry v2 API
+// path. Names can span several segments (/v2/hexpm/elixir/manifests/latest),
+// so the name is everything before the rightmost API endpoint segment
+// (manifests, blobs, tags, referrers) rather than the first segment. It returns
+// "" for the bare /v2/ ping endpoint (which has no image).
+func repoNameFromPath(path string) string {
 	rest := strings.TrimPrefix(path, "/v2/")
 	if rest == "" || rest == path {
 		return ""
 	}
-	if i := strings.IndexByte(rest, '/'); i >= 0 {
-		return rest[:i]
+	segments := strings.Split(rest, "/")
+	for i := len(segments) - 1; i > 0; i-- {
+		switch segments[i] {
+		case "manifests", "blobs", "tags", "referrers":
+			return strings.Join(segments[:i], "/")
+		}
 	}
 	return rest
 }
 
+// imageAllowed reports whether repo passes the allowlist. An entry with a
+// slash ("hexpm/elixir") allows exactly that repository, so a single image can
+// be served under its real namespaced name without opening the namespace. An
+// entry without one ("ruby", "distroless") allows the repository and anything
+// beneath it, matching on the first segment.
+func imageAllowed(allowed map[string]struct{}, repo string) bool {
+	if _, ok := allowed[repo]; ok {
+		return true
+	}
+	first, _, _ := strings.Cut(repo, "/")
+	_, ok := allowed[first]
+	return ok
+}
+
 // allowlistMiddleware guards the /v2/ registry proxy with an image-name
 // allowlist. When the allowlist is empty (nil), all requests pass through
-// unchanged. Otherwise any /v2/{image}/... request whose image name is not in
-// the allowlist is rejected with 404. The bare /v2/ ping endpoint always
-// passes, since it carries no image name.
+// unchanged. Otherwise any /v2/{image}/... request whose image the allowlist
+// doesn't cover (see imageAllowed) is rejected with 404. The bare /v2/ ping
+// endpoint always passes, since it carries no image name.
 func allowlistMiddleware(allowed map[string]struct{}, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if len(allowed) > 0 {
-			if image := imageNameFromPath(r.URL.Path); image != "" {
-				if _, ok := allowed[image]; !ok {
+			if image := repoNameFromPath(r.URL.Path); image != "" {
+				if !imageAllowed(allowed, image) {
 					log.Printf("rejecting request for disallowed image %q: %s", image, r.URL.Path)
 					http.NotFound(w, r)
 					return

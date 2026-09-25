@@ -39,7 +39,7 @@ func TestParseAllowedImages(t *testing.T) {
 	}
 }
 
-func TestImageNameFromPath(t *testing.T) {
+func TestRepoNameFromPath(t *testing.T) {
 	cases := []struct {
 		path string
 		want string
@@ -49,13 +49,19 @@ func TestImageNameFromPath(t *testing.T) {
 		{"/v2/ruby/blobs/sha256:abc", "ruby"},
 		{"/v2/postgres/tags/list", "postgres"},
 		{"/v2/miren", "miren"},
+		{"/v2/hexpm/elixir/manifests/1.19.6-slim", "hexpm/elixir"},
+		{"/v2/hexpm/elixir/blobs/sha256:abc", "hexpm/elixir"},
+		{"/v2/hexpm/elixir/blobs/uploads/some-uuid", "hexpm/elixir"},
+		{"/v2/hexpm/elixir/tags/list", "hexpm/elixir"},
+		{"/v2/distroless/static-debian12/manifests/nonroot", "distroless/static-debian12"},
+		{"/v2/a/b/c/referrers/sha256:abc", "a/b/c"},
 		{"/_token", ""}, // not a /v2/ path
 		{"/", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.path, func(t *testing.T) {
-			if got := imageNameFromPath(tc.path); got != tc.want {
-				t.Errorf("imageNameFromPath(%q) = %q, want %q", tc.path, got, tc.want)
+			if got := repoNameFromPath(tc.path); got != tc.want {
+				t.Errorf("repoNameFromPath(%q) = %q, want %q", tc.path, got, tc.want)
 			}
 		})
 	}
@@ -68,7 +74,7 @@ func TestAllowlistMiddleware(t *testing.T) {
 		w.WriteHeader(reachedStatus)
 	})
 
-	allowSet := map[string]struct{}{"ruby": {}, "miren": {}}
+	allowSet := map[string]struct{}{"ruby": {}, "miren": {}, "distroless": {}, "hexpm/elixir": {}}
 
 	cases := []struct {
 		name    string
@@ -80,6 +86,11 @@ func TestAllowlistMiddleware(t *testing.T) {
 		{"second allowed image passes", allowSet, "/v2/miren/tags/list", reachedStatus},
 		{"disallowed image 404s", allowSet, "/v2/python/manifests/latest", http.StatusNotFound},
 		{"case-sensitive mismatch 404s", allowSet, "/v2/Ruby/manifests/latest", http.StatusNotFound},
+		{"bare entry covers images beneath it", allowSet, "/v2/distroless/static-debian12/manifests/nonroot", reachedStatus},
+		{"exact namespaced entry passes", allowSet, "/v2/hexpm/elixir/manifests/1.19.6-slim", reachedStatus},
+		{"exact namespaced entry passes blobs", allowSet, "/v2/hexpm/elixir/blobs/sha256:abc", reachedStatus},
+		{"exact entry doesn't open its namespace", allowSet, "/v2/hexpm/erlang/manifests/latest", http.StatusNotFound},
+		{"namespace alone isn't an image", allowSet, "/v2/hexpm/manifests/latest", http.StatusNotFound},
 		{"v2 root never blocked", allowSet, "/v2/", reachedStatus},
 		{"empty allowlist allows all", nil, "/v2/anything/manifests/latest", reachedStatus},
 		{"empty allowlist allows v2 root", nil, "/v2/", reachedStatus},
@@ -248,4 +259,3 @@ func TestResolveScopePath(t *testing.T) {
 		})
 	}
 }
-
