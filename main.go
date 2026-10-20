@@ -19,7 +19,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -102,7 +101,7 @@ func main() {
 	if basic := os.Getenv("AUTH_HEADER"); basic != "" {
 		auth = authHeader(basic)
 	} else if gcpKey := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); gcpKey != "" {
-		b, err := ioutil.ReadFile(gcpKey)
+		b, err := os.ReadFile(gcpKey)
 		if err != nil {
 			log.Fatalf("could not read key file from %s: %+v", gcpKey, err)
 		}
@@ -167,7 +166,10 @@ func captureHostHeader(next http.Handler) http.Handler {
 func tokenProxyHandler(tokenEndpoint, repoPrefix string, aliases map[string]string) http.HandlerFunc {
 	return (&httputil.ReverseProxy{
 		FlushInterval: -1,
-		Director: func(r *http.Request) {
+		// Rewrite would drop inbound X-Forwarded-* headers and stop appending
+		// X-Forwarded-For, which upstream registries currently see. Keep Director
+		// until that change is made on purpose.
+		Director: func(r *http.Request) { //nolint:staticcheck // SA1019, see above
 			orig := r.URL.String()
 
 			q := r.URL.Query()
@@ -426,7 +428,7 @@ func allowlistMiddleware(allowed map[string]struct{}, next http.Handler) http.Ha
 func registryAPIProxy(cfg registryConfig, auth authenticator) http.HandlerFunc {
 	return (&httputil.ReverseProxy{
 		FlushInterval: -1,
-		Director:      rewriteRegistryV2URL(cfg),
+		Director:      rewriteRegistryV2URL(cfg), //nolint:staticcheck // SA1019, see tokenProxyHandler
 		Transport: &registryRoundtripper{
 			auth: auth,
 		},
